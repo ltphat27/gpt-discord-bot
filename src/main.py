@@ -29,6 +29,16 @@ from src.moderation import (
     send_moderation_flagged_message,
 )
 
+from src.moderation import (
+    moderate_message,
+    send_moderation_blocked_message,
+    send_moderation_flagged_message,
+)
+
+import os
+from flask import Flask
+from threading import Thread
+
 logging.basicConfig(
     format="[%(asctime)s] [%(filename)s:%(lineno)d] %(message)s", level=logging.INFO
 )
@@ -177,7 +187,7 @@ async def handle_mention_message(message: DiscordMessage):
         # If message is empty after removing mentions, ignore
         if not content:
             await message.channel.send(
-                f"Xin chào <@{message.author.id}>! Bạn cần gì không? 🤖",
+                f"Hi <@{message.author.id}>! Bạn cần gì không? 🤖",
                 reference=message
             )
             return
@@ -442,5 +452,23 @@ async def on_message(message: DiscordMessage):
     except Exception as e:
         logger.exception(e)
 
+
+app = Flask(__name__)
+
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+
+def run_flask():
+    # get port from environment variable, if not set, use 8080
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+
+# run flask
+flask_thread = Thread(target=run_flask)
+flask_thread.start()
 
 client.run(DISCORD_BOT_TOKEN)
