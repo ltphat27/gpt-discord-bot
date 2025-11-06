@@ -1,3 +1,6 @@
+from src.utils import logger
+import discord
+from typing import Optional, Tuple
 from openai._compat import model_dump
 
 from src.constants import (
@@ -8,16 +11,14 @@ from src.constants import (
 from openai import OpenAI
 
 client = OpenAI()
-from typing import Optional, Tuple
-import discord
-from src.utils import logger
 
 
 def moderate_message(
     message: str, user: str
 ) -> Tuple[str, str]:  # [flagged_str, blocked_str]
     moderation_response = client.moderations.create(
-        input=message, model="text-moderation-latest"
+        input=message,
+        model="omni-moderation-latest",
     )
     category_scores = moderation_response.results[0].category_scores or {}
 

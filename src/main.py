@@ -4,16 +4,13 @@ from typing import Literal, Optional, Union
 import discord
 from discord import Message as DiscordMessage, app_commands
 import logging
-from src.base import Message, Conversation, ThreadConfig
+from src.base import Message, Conversation
 from src.constants import (
     BOT_INVITE_URL,
     DISCORD_BOT_TOKEN,
-    EXAMPLE_CONVOS,
     ACTIVATE_THREAD_PREFX,
     MAX_THREAD_MESSAGES,
     SECONDS_DELAY_RECEIVING_MSG,
-    AVAILABLE_MODELS,
-    DEFAULT_MODEL,
 )
 import asyncio
 from src.utils import (
@@ -22,9 +19,10 @@ from src.utils import (
     close_thread,
     is_last_message_stale,
     discord_message_to_message,
+    split_into_shorter_messages,
 )
 from src import completion
-from src.completion import generate_completion_response, process_response
+from src.completion import generate_completion_response, process_response, client as openai_client  # Import client
 from src.moderation import (
     moderate_message,
     send_moderation_blocked_message,
@@ -40,26 +38,21 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
-thread_data = defaultdict()
+
+openai_thread_mapping = {}
+user_mention_threads = {}
 
 
 @client.event
 async def on_ready():
-    logger.info(f"We have logged in as {client.user}. Invite URL: {BOT_INVITE_URL}")
+    logger.info(
+        f"We have logged in as {client.user}. Invite URL: {BOT_INVITE_URL}")
+
     completion.MY_BOT_NAME = client.user.name
-    completion.MY_BOT_EXAMPLE_CONVOS = []
-    for c in EXAMPLE_CONVOS:
-        messages = []
-        for m in c.messages:
-            if m.user == "Lenard":
-                messages.append(Message(user=client.user.name, text=m.text))
-            else:
-                messages.append(m)
-        completion.MY_BOT_EXAMPLE_CONVOS.append(Conversation(messages=messages))
+
     await tree.sync()
 
 
-# /chat message:
 @tree.command(name="chat", description="Create a new thread for conversation")
 @discord.app_commands.checks.has_permissions(send_messages=True)
 @discord.app_commands.checks.has_permissions(view_channel=True)
@@ -67,19 +60,9 @@ async def on_ready():
 @discord.app_commands.checks.bot_has_permissions(view_channel=True)
 @discord.app_commands.checks.bot_has_permissions(manage_threads=True)
 @app_commands.describe(message="The first prompt to start the chat with")
-@app_commands.describe(model="The model to use for the chat")
-@app_commands.describe(
-    temperature="Controls randomness. Higher values mean more randomness. Between 0 and 1"
-)
-@app_commands.describe(
-    max_tokens="How many tokens the model should output at max for each message."
-)
 async def chat_command(
     int: discord.Interaction,
     message: str,
-    model: AVAILABLE_MODELS = DEFAULT_MODEL,
-    temperature: Optional[float] = 1.0,
-    max_tokens: Optional[int] = 512,
 ):
     try:
         # only support creating thread in text channel
@@ -93,25 +76,10 @@ async def chat_command(
         user = int.user
         logger.info(f"Chat command by {user} {message[:20]}")
 
-        # Check for valid temperature
-        if temperature is not None and (temperature < 0 or temperature > 1):
-            await int.response.send_message(
-                f"You supplied an invalid temperature: {temperature}. Temperature must be between 0 and 1.",
-                ephemeral=True,
-            )
-            return
-
-        # Check for valid max_tokens
-        if max_tokens is not None and (max_tokens < 1 or max_tokens > 4096):
-            await int.response.send_message(
-                f"You supplied an invalid max_tokens: {max_tokens}. Max tokens must be between 1 and 4096.",
-                ephemeral=True,
-            )
-            return
-
         try:
             # moderate the message
-            flagged_str, blocked_str = moderate_message(message=message, user=user)
+            flagged_str, blocked_str = moderate_message(
+                message=message, user=user)
             await send_moderation_blocked_message(
                 guild=int.guild,
                 user=user,
@@ -130,9 +98,7 @@ async def chat_command(
                 description=f"<@{user.id}> wants to chat! 🤖💬",
                 color=discord.Color.green(),
             )
-            embed.add_field(name="model", value=model)
-            embed.add_field(name="temperature", value=temperature, inline=True)
-            embed.add_field(name="max_tokens", value=max_tokens, inline=True)
+
             embed.add_field(name=user.name, value=message)
 
             if len(flagged_str) > 0:
@@ -157,22 +123,35 @@ async def chat_command(
             )
             return
 
-        # create the thread
+        # create the discord thread
         thread = await response.create_thread(
             name=f"{ACTIVATE_THREAD_PREFX} {user.name[:20]} - {message[:30]}",
             slowmode_delay=1,
             reason="gpt-bot",
             auto_archive_duration=60,
         )
-        thread_data[thread.id] = ThreadConfig(
-            model=model, max_tokens=max_tokens, temperature=temperature
-        )
+
+        # create a new openai thread
+        try:
+            new_openai_thread = await openai_client.beta.threads.create()
+        except Exception as e:
+            logger.exception("Failed to create OpenAI thread.")
+            await thread.send(f"Bot lỗi: Không thể tạo luồng OpenAI. {str(e)}")
+            return
+
+        # save the link
+        openai_thread_mapping[thread.id] = new_openai_thread.id
+        logger.info(
+            f"Created new OpenAI thread {new_openai_thread.id} for Discord thread {thread.id}")
+
         async with thread.typing():
             # fetch completion
-            messages = [Message(user=user.name, text=message)]
             response_data = await generate_completion_response(
-                messages=messages, user=user, thread_config=thread_data[thread.id]
+                openai_thread_id=new_openai_thread.id,
+                last_user_message=message,
+                user=user
             )
+
             # send the result
             await process_response(
                 user=user, thread=thread, response_data=response_data
@@ -181,6 +160,152 @@ async def chat_command(
         logger.exception(e)
         await int.response.send_message(
             f"Failed to start chat {str(e)}", ephemeral=True
+        )
+
+
+# handle when bot is mentioned
+async def handle_mention_message(message: DiscordMessage):
+    try:
+        # Remove the bot mention from the message content
+        content = message.content
+        for mention in message.mentions:
+            if mention.id == client.user.id:
+                content = content.replace(
+                    f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+        content = content.strip()
+
+        # If message is empty after removing mentions, ignore
+        if not content:
+            await message.channel.send(
+                f"Xin chào <@{message.author.id}>! Bạn cần gì không? 🤖",
+                reference=message
+            )
+            return
+
+        # moderate the message
+        flagged_str, blocked_str = moderate_message(
+            message=content, user=message.author
+        )
+        await send_moderation_blocked_message(
+            guild=message.guild,
+            user=message.author,
+            blocked_str=blocked_str,
+            message=content,
+        )
+        if len(blocked_str) > 0:
+            await message.channel.send(
+                embed=discord.Embed(
+                    # Write comment in English
+                    description=f"❌ **{message.author.mention}'s message has been blocked by moderation.**",
+                    color=discord.Color.red(),
+                ),
+                reference=message
+            )
+            return
+
+        await send_moderation_flagged_message(
+            guild=message.guild,
+            user=message.author,
+            flagged_str=flagged_str,
+            message=content,
+            url=message.jump_url,
+        )
+
+        if len(flagged_str) > 0:
+            await message.channel.send(
+                embed=discord.Embed(
+                    description=f"⚠️ **{message.author.mention}'s message has been flagged by moderation.**",
+                    color=discord.Color.yellow(),
+                ),
+                reference=message
+            )
+
+        # Show typing indicator
+        async with message.channel.typing():
+
+            # find the openai thread for the user
+            user_id = message.author.id
+            openai_thread_id = user_mention_threads.get(user_id)
+
+            if not openai_thread_id:
+                try:
+                    new_thread = await openai_client.beta.threads.create()
+                    openai_thread_id = new_thread.id
+                    user_mention_threads[user_id] = openai_thread_id
+                    logger.info(
+                        f"Created new mention thread {openai_thread_id} for user {user_id}")
+                except Exception as e:
+                    logger.exception(
+                        f"Failed to create OpenAI thread for user {user_id}")
+                    await message.channel.send(f"Bot lỗi: Không thể tạo luồng OpenAI. {str(e)}", reference=message)
+                    return
+
+            # Generate response
+            response_data = await generate_completion_response(
+                openai_thread_id=openai_thread_id,
+                last_user_message=content,
+                user=message.author,
+            )
+
+            # Send response
+            status = response_data.status
+            reply_text = response_data.reply_text
+            status_text = response_data.status_text
+
+            if status is completion.CompletionResult.OK or status is completion.CompletionResult.MODERATION_FLAGGED:
+                if not reply_text:
+                    await message.channel.send(
+                        embed=discord.Embed(
+                            description=f"**Invalid response** - empty response",
+                            color=discord.Color.yellow(),
+                        ),
+                        reference=message
+                    )
+                else:
+                    shorter_response = split_into_shorter_messages(reply_text)
+                    for i, r in enumerate(shorter_response):
+                        # Only reference the original message for the first reply
+                        if i == 0:
+                            await message.channel.send(r, reference=message)
+                        else:
+                            await message.channel.send(r)
+
+                if status is completion.CompletionResult.MODERATION_FLAGGED:
+                    await message.channel.send(
+                        embed=discord.Embed(
+                            description=f"⚠️ **This response has been flagged by moderation.**",
+                            color=discord.Color.yellow(),
+                        )
+                    )
+            elif status is completion.CompletionResult.MODERATION_BLOCKED:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"❌ **This response has been blocked by moderation.**",
+                        color=discord.Color.red(),
+                    ),
+                    reference=message
+                )
+            elif status is completion.CompletionResult.INVALID_REQUEST:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"**Invalid request** - {status_text}",
+                        color=discord.Color.yellow(),
+                    ),
+                    reference=message
+                )
+            else:
+                await message.channel.send(
+                    embed=discord.Embed(
+                        description=f"**Error** - {status_text}",
+                        color=discord.Color.yellow(),
+                    ),
+                    reference=message
+                )
+    except Exception as e:
+        logger.exception(e)
+        await message.channel.send(
+            f"Sorry, an error occurred while processing your message: {str(e)}",
+            reference=message
         )
 
 
@@ -196,9 +321,12 @@ async def on_message(message: DiscordMessage):
         if message.author == client.user:
             return
 
-        # ignore messages not in a thread
+        # check if bot is mentioned in a non-thread channel
         channel = message.channel
         if not isinstance(channel, discord.Thread):
+            # handle mentions in regular channels
+            if client.user.mentioned_in(message):
+                await handle_mention_message(message)
             return
 
         # ignore threads not created by the bot
@@ -221,6 +349,7 @@ async def on_message(message: DiscordMessage):
             return
 
         # moderate the message
+        # (Giữ nguyên code moderation)
         flagged_str, blocked_str = moderate_message(
             message=message.content, user=message.author
         )
@@ -278,19 +407,24 @@ async def on_message(message: DiscordMessage):
             f"Thread message to process - {message.author}: {message.content[:50]} - {thread.name} {thread.jump_url}"
         )
 
-        channel_messages = [
-            discord_message_to_message(message)
-            async for message in thread.history(limit=MAX_THREAD_MESSAGES)
-        ]
-        channel_messages = [x for x in channel_messages if x is not None]
-        channel_messages.reverse()
+        # --- BẮT ĐẦU CODE MỚI ---
+
+        # get the openai thread id for the thread
+        openai_thread_id = openai_thread_mapping.get(thread.id)
+
+        if not openai_thread_id:
+            # handle the case where the thread is not found
+            logger.warning(
+                f"Không tìm thấy OpenAI thread_id cho Discord thread {thread.id}. Bỏ qua.")
+            await thread.send("Bot gặp lỗi: Không tìm thấy ID luồng hội thoại (OpenAI thread ID). Luồng này có thể đã cũ. Vui lòng bắt đầu lại bằng `/chat`.")
+            return
 
         # generate the response
         async with thread.typing():
             response_data = await generate_completion_response(
-                messages=channel_messages,
+                openai_thread_id=openai_thread_id,
+                last_user_message=message.content,
                 user=message.author,
-                thread_config=thread_data[thread.id],
             )
 
         if is_last_message_stale(

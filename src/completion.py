@@ -2,6 +2,8 @@ from enum import Enum
 from dataclasses import dataclass
 import openai
 from openai import AsyncOpenAI
+import os
+import asyncio
 
 from src.moderation import moderate_message
 from typing import Optional, List
@@ -20,6 +22,12 @@ from src.moderation import (
 
 MY_BOT_NAME = BOT_NAME
 MY_BOT_EXAMPLE_CONVOS = EXAMPLE_CONVOS
+
+ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID")
+if not ASSISTANT_ID:
+    logger.error("OPENAI_ASSISTANT_ID environment variable not set.")
+
+POLL_INTERVAL_S = 0.5
 
 
 class CompletionResult(Enum):
@@ -40,32 +48,73 @@ class CompletionData:
 
 client = AsyncOpenAI()
 
+# chat with the assistant
+
 
 async def generate_completion_response(
-    messages: List[Message], user: str, thread_config: ThreadConfig
+    openai_thread_id: str,
+    last_user_message: str,
+    user: str,
 ) -> CompletionData:
+
+    if not ASSISTANT_ID:
+        return CompletionData(
+            status=CompletionResult.OTHER_ERROR,
+            reply_text=None,
+            status_text="Error: OPENAI_ASSISTANT_ID is not config.",
+        )
+
     try:
-        prompt = Prompt(
-            header=Message(
-                "system", f"Instructions for {MY_BOT_NAME}: {BOT_INSTRUCTIONS}"
-            ),
-            examples=MY_BOT_EXAMPLE_CONVOS,
-            convo=Conversation(messages),
+        # add the user's message to the thread
+        await client.beta.threads.messages.create(
+            thread_id=openai_thread_id,
+            role="user",
+            content=last_user_message
         )
-        rendered = prompt.full_render(MY_BOT_NAME)
-        response = await client.chat.completions.create(
-            model=thread_config.model,
-            messages=rendered,
-            temperature=thread_config.temperature,
-            top_p=1.0,
-            max_tokens=thread_config.max_tokens,
-            stop=["<|endoftext|>"],
+
+        # create a run to run the assistant
+        run = await client.beta.threads.runs.create(
+            thread_id=openai_thread_id,
+            assistant_id=ASSISTANT_ID,
         )
-        reply = response.choices[0].message.content.strip()
-        if reply:
-            flagged_str, blocked_str = moderate_message(
-                message=(rendered[-1]["content"] + reply)[-500:], user=user
+
+        # wait for the run to complete
+        while run.status in ["queued", "in_progress"]:
+            await asyncio.sleep(POLL_INTERVAL_S)
+            run = await client.beta.threads.runs.retrieve(
+                thread_id=openai_thread_id,
+                run_id=run.id
             )
+
+        # check the final status of the run
+        if run.status == "completed":
+            # get the latest message from the thread
+            messages = await client.beta.threads.messages.list(
+                thread_id=openai_thread_id,
+                order="desc",
+                limit=1
+            )
+
+            reply = ""
+            if messages.data and messages.data[0].role == "assistant":
+                for content_part in messages.data[0].content:
+                    if content_part.type == "text":
+                        reply += content_part.text.value
+
+            reply = reply.strip()
+
+            if not reply:
+                # return OK but no text, main.py will handle it
+                return CompletionData(
+                    status=CompletionResult.OK, reply_text=None, status_text="Assistant did not return a text message."
+                )
+
+            # moderate the response
+            moderate_context = (last_user_message + reply)[-500:]
+            flagged_str, blocked_str = moderate_message(
+                message=moderate_context, user=user
+            )
+
             if len(blocked_str) > 0:
                 return CompletionData(
                     status=CompletionResult.MODERATION_BLOCKED,
@@ -80,21 +129,37 @@ async def generate_completion_response(
                     status_text=f"from_response:{flagged_str}",
                 )
 
-        return CompletionData(
-            status=CompletionResult.OK, reply_text=reply, status_text=None
-        )
-    except openai.BadRequestError as e:
-        if "This model's maximum context length" in str(e):
+            # All OK
             return CompletionData(
-                status=CompletionResult.TOO_LONG, reply_text=None, status_text=str(e)
+                status=CompletionResult.OK, reply_text=reply, status_text=None
+            )
+
+        # handle the error status of the run
+        elif run.status == "failed":
+            error_message = run.last_error.message if run.last_error else "Unknown error"
+            logger.error(
+                f"Run failed for thread {openai_thread_id}: {error_message}")
+            return CompletionData(
+                status=CompletionResult.OTHER_ERROR,
+                reply_text=None,
+                status_text=f"Run failed: {error_message}",
             )
         else:
-            logger.exception(e)
+            # handle the unhandled status of the run
+            logger.error(f"Run ended with unhandled status: {run.status}")
             return CompletionData(
-                status=CompletionResult.INVALID_REQUEST,
+                status=CompletionResult.OTHER_ERROR,
                 reply_text=None,
-                status_text=str(e),
+                status_text=f"Run ended with status: {run.status}",
             )
+
+    except openai.BadRequestError as e:
+        logger.exception(e)
+        return CompletionData(
+            status=CompletionResult.INVALID_REQUEST,
+            reply_text=None,
+            status_text=str(e),
+        )
     except Exception as e:
         logger.exception(e)
         return CompletionData(
