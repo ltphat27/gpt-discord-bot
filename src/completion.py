@@ -46,7 +46,10 @@ class CompletionData:
     status_text: Optional[str]
 
 
-client = AsyncOpenAI()
+# client = AsyncOpenAI()
+client = AsyncOpenAI(
+    default_headers={"OpenAI-Beta": "assistants=v2"}
+)
 
 # chat with the assistant
 
