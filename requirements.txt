@@ -1,6 +1,6 @@
 discord.py==2.1.*
 python-dotenv==0.21.*
-openai==1.2.0
+openai
 httpx==0.24.1
 httpcore==0.17.3
 PyYAML==6.0
