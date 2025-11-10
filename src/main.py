@@ -187,7 +187,7 @@ async def handle_mention_message(message: DiscordMessage):
         # If message is empty after removing mentions, ignore
         if not content:
             await message.channel.send(
-                f"Hi <@{message.author.id}>! Bạn cần gì không? 🤖",
+                f"Hi <@{message.author.id}>! Can I help you? 🤖",
                 reference=message
             )
             return
@@ -205,7 +205,6 @@ async def handle_mention_message(message: DiscordMessage):
         if len(blocked_str) > 0:
             await message.channel.send(
                 embed=discord.Embed(
-                    # Write comment in English
                     description=f"❌ **{message.author.mention}'s message has been blocked by moderation.**",
                     color=discord.Color.red(),
                 ),
@@ -359,7 +358,6 @@ async def on_message(message: DiscordMessage):
             return
 
         # moderate the message
-        # (Giữ nguyên code moderation)
         flagged_str, blocked_str = moderate_message(
             message=message.content, user=message.author
         )
@@ -417,16 +415,14 @@ async def on_message(message: DiscordMessage):
             f"Thread message to process - {message.author}: {message.content[:50]} - {thread.name} {thread.jump_url}"
         )
 
-        # --- BẮT ĐẦU CODE MỚI ---
-
         # get the openai thread id for the thread
         openai_thread_id = openai_thread_mapping.get(thread.id)
 
         if not openai_thread_id:
             # handle the case where the thread is not found
             logger.warning(
-                f"Không tìm thấy OpenAI thread_id cho Discord thread {thread.id}. Bỏ qua.")
-            await thread.send("Bot gặp lỗi: Không tìm thấy ID luồng hội thoại (OpenAI thread ID). Luồng này có thể đã cũ. Vui lòng bắt đầu lại bằng `/chat`.")
+                f"Cannot find OpenAI thread_id for Discord thread {thread.id}. Skipping.")
+            await thread.send("Bot error: Cannot find OpenAI thread ID. This thread may be old. Please start again with `/chat`.")
             return
 
         # generate the response
